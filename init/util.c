@@ -329,13 +329,13 @@ void sanitize(char *s)
     if (!s)
         return;
 
-    for (; *s; s++) {
+    while (*s) {
         s += strspn(s, accept);
-        if (*s) *s = '_';
+        if (*s) *s++ = '_';
     }
 }
 
-void make_link(const char *oldpath, const char *newpath)
+void make_link_init(const char *oldpath, const char *newpath)
 {
     int ret;
     char buf[256];

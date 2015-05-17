@@ -40,6 +40,9 @@
 #include "mincrypt/sha.h"
 #include "mincrypt/sha256.h"
 
+#include "ext4_utils.h"
+#include "wipe.h"
+
 #include "fs_mgr_priv.h"
 #include "fs_mgr_priv_verity.h"
 
@@ -141,9 +144,10 @@ static void check_fs(char *blk_device, char *fs_type, char *target)
     } else if (!strcmp(fs_type, "f2fs")) {
             char *f2fs_fsck_argv[] = {
                     F2FS_FSCK_BIN,
+                    "-f",
                     blk_device
             };
-        INFO("Running %s on %s\n", F2FS_FSCK_BIN, blk_device);
+        INFO("Running %s -f %s\n", F2FS_FSCK_BIN, blk_device);
 
         ret = android_fork_execvp_ext(ARRAY_SIZE(f2fs_fsck_argv), f2fs_fsck_argv,
                                       &status, true, LOG_KLOG | LOG_FILE,
@@ -242,6 +246,25 @@ static int device_is_debuggable() {
     ret = __system_property_get("ro.debuggable", value);
     if (ret < 0)
         return ret;
+    return strcmp(value, "1") ? 0 : 1;
+}
+
+static int device_is_secure() {
+    int ret = -1;
+    char value[PROP_VALUE_MAX];
+    ret = __system_property_get("ro.secure", value);
+    /* If error, we want to fail secure */
+    if (ret < 0)
+        return 1;
+    return strcmp(value, "0") ? 1 : 0;
+}
+
+static int device_is_force_encrypted() {
+    int ret = -1;
+    char value[PROP_VALUE_MAX];
+    ret = __system_property_get("ro.vold.forceencryption", value);
+    if (ret < 0)
+        return 0;
     return strcmp(value, "1") ? 0 : 1;
 }
 
@@ -350,14 +373,18 @@ int fs_mgr_mount_all(struct fstab *fstab)
             wait_for_file(fstab->recs[i].blk_device, WAIT_TIMEOUT);
         }
 
-        if ((fstab->recs[i].fs_mgr_flags & MF_VERIFY) &&
-            !device_is_debuggable()) {
-            if (fs_mgr_setup_verity(&fstab->recs[i]) < 0) {
+        if ((fstab->recs[i].fs_mgr_flags & MF_VERIFY) && device_is_secure()) {
+            int rc = fs_mgr_setup_verity(&fstab->recs[i]);
+            if (device_is_debuggable() && rc == FS_MGR_SETUP_VERITY_DISABLED) {
+                INFO("Verity disabled");
+            } else if (rc != FS_MGR_SETUP_VERITY_SUCCESS) {
                 ERROR("Could not set up verified partition, skipping!\n");
                 continue;
             }
         }
         int last_idx_inspected;
+        int top_idx = i;
+
         mret = mount_with_alternatives(fstab, i, &last_idx_inspected, &attempted_idx);
         i = last_idx_inspected;
         mount_errno = errno;
@@ -365,7 +392,9 @@ int fs_mgr_mount_all(struct fstab *fstab)
         /* Deal with encryptability. */
         if (!mret) {
             /* If this is encryptable, need to trigger encryption */
-            if ((fstab->recs[attempted_idx].fs_mgr_flags & MF_FORCECRYPT)) {
+            if (   (fstab->recs[attempted_idx].fs_mgr_flags & MF_FORCECRYPT)
+                || (device_is_force_encrypted()
+                    && fs_mgr_is_encryptable(&fstab->recs[attempted_idx]))) {
                 if (umount(fstab->recs[attempted_idx].mount_point) == 0) {
                     if (encryptable == FS_MGR_MNTALL_DEV_NOT_ENCRYPTED) {
                         ERROR("Will try to encrypt %s %s\n", fstab->recs[attempted_idx].mount_point,
@@ -385,10 +414,38 @@ int fs_mgr_mount_all(struct fstab *fstab)
             continue;
         }
 
-        /* mount(2) returned an error, check if it's encryptable and deal with it */
+        /* mount(2) returned an error, handle the encryptable/formattable case */
+        bool wiped = partition_wiped(fstab->recs[top_idx].blk_device);
+        if (mret && mount_errno != EBUSY && mount_errno != EACCES &&
+            fs_mgr_is_formattable(&fstab->recs[top_idx]) && wiped) {
+            /* top_idx and attempted_idx point at the same partition, but sometimes
+             * at two different lines in the fstab.  Use the top one for formatting
+             * as that is the preferred one.
+             */
+            ERROR("%s(): %s is wiped and %s %s is formattable. Format it.\n", __func__,
+                  fstab->recs[top_idx].blk_device, fstab->recs[top_idx].mount_point,
+                  fstab->recs[top_idx].fs_type);
+            if (fs_mgr_is_encryptable(&fstab->recs[top_idx]) &&
+                strcmp(fstab->recs[top_idx].key_loc, KEY_IN_FOOTER)) {
+                int fd = open(fstab->recs[top_idx].key_loc, O_WRONLY, 0644);
+                if (fd >= 0) {
+                    INFO("%s(): also wipe %s\n", __func__, fstab->recs[top_idx].key_loc);
+                    wipe_block_device(fd, get_file_size(fd));
+                    close(fd);
+                } else {
+                    ERROR("%s(): %s wouldn't open (%s)\n", __func__,
+                          fstab->recs[top_idx].key_loc, strerror(errno));
+                }
+            }
+            if (fs_mgr_do_format(&fstab->recs[top_idx]) == 0) {
+                /* Let's replay the mount actions. */
+                i = top_idx - 1;
+                continue;
+            }
+        }
         if (mret && mount_errno != EBUSY && mount_errno != EACCES &&
             fs_mgr_is_encryptable(&fstab->recs[attempted_idx])) {
-            if(partition_wiped(fstab->recs[attempted_idx].blk_device)) {
+            if (wiped) {
                 ERROR("%s(): %s is wiped and %s %s is encryptable. Suggest recovery...\n", __func__,
                       fstab->recs[attempted_idx].blk_device, fstab->recs[attempted_idx].mount_point,
                       fstab->recs[attempted_idx].fs_type);
@@ -467,9 +524,11 @@ int fs_mgr_do_mount(struct fstab *fstab, char *n_name, char *n_blk_device,
                      fstab->recs[i].mount_point);
         }
 
-        if ((fstab->recs[i].fs_mgr_flags & MF_VERIFY) &&
-            !device_is_debuggable()) {
-            if (fs_mgr_setup_verity(&fstab->recs[i]) < 0) {
+        if ((fstab->recs[i].fs_mgr_flags & MF_VERIFY) && device_is_secure()) {
+            int rc = fs_mgr_setup_verity(&fstab->recs[i]);
+            if (device_is_debuggable() && rc == FS_MGR_SETUP_VERITY_DISABLED) {
+                INFO("Verity disabled");
+            } else if (rc != FS_MGR_SETUP_VERITY_SUCCESS) {
                 ERROR("Could not set up verified partition, skipping!\n");
                 continue;
             }
